@@ -210,7 +210,7 @@ LOG_LINES = [
     ("\u2713 WebAudio bleeps wired", GREEN, F_MONO_B),
     ("\u2713 node --check \u2014 syntax OK", GREEN, F_MONO_B),
     ("\u2713 main.ts \u2014 POST.json copies clean", GREEN, F_MONO_B),
-    ("BUILD COMPLETE \u2014 348 lines, 0 libraries", MAGENTA, F_MONO_B),
+    ("BUILD COMPLETE \u2014 359 lines, 0 libraries", MAGENTA, F_MONO_B),
 ]
 
 
