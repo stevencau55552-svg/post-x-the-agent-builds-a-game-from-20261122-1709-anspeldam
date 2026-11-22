@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ORBIT DODGE — built from one prompt</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #07040d; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; background: #07040d; max-width: 100vw; max-height: 100vh;
+           box-shadow: 0 0 60px rgba(196, 28, 131, 0.35); }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+// ORBIT DODGE — a tiny neon space dodger, built from one prompt.
+// Controls: Arrow keys / A D, or mouse / touch. R restarts after game over.
+// No libraries, no network, everything inline.
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width;
+const H = canvas.height;
+
+const MAGENTA = '#c41c83';
+const CYAN = '#22d3ee';
+const GOLD = '#ffd166';
+const INK = '#07040d';
+
+// ---- audio (WebAudio bleeps, created on first user gesture) ----
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { audioCtx = null; }
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+function beep(freq, dur, type, vol) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type || 'square';
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(vol || 0.08, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + dur);
+}
+
+// ---- state ----
+let state = 'title'; // 'title' | 'playing' | 'over'
+let score = 0;
+let lives = 3;
+let elapsed = 0;
+let shakeT = 0;
+let invulnT = 0;
+let asteroidTimer = 0;
+let starTimer = 0;
+let popups = [];   // {x, y, text, life}
+let particles = []; // {x, y, vx, vy, life, color, r}
+let asteroids = []; // {x, y, r, vy, rot, vr}
+let stars = [];     // {x, y, r, vy, phase}
+let bgStars = [];   // {x, y, r, speed, tw}
+for (let i = 0; i < 90; i++) {
+  bgStars.push({ x: Math.random() * W, y: Math.random() * H,
+    r: 0.5 + Math.random() * 1.6, speed: 12 + Math.random() * 40, tw: Math.random() * 6.28 });
+}
+
+const ship = { x: W / 2, y: H - 60, r: 18, speed: 420, targetX: W / 2, usingPointer: false };
+
+// ---- input ----
+const keys = {};
+window.addEventListener('keydown', (e) => {
+  ensureAudio();
+  keys[e.key] = true;
+  if (state === 'title') startGame();
+  else if (state === 'over' && (e.key === 'r' || e.key === 'R' || e.key === 'Enter')) startGame();
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === ' ') e.preventDefault();
+});
+window.addEventListener('keyup', (e) => { keys[e.key] = false; });
+// A stuck key (e.g. alt-tab while holding an arrow) must not keep the ship
+// flying on its own when the player comes back.
+window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+function pointerMove(clientX) {
+  ensureAudio();
+  const rect = canvas.getBoundingClientRect();
+  ship.targetX = (clientX - rect.left) * (W / rect.width);
+  ship.usingPointer = true;
+  if (state === 'title') startGame();
+}
+canvas.addEventListener('mousemove', (e) => pointerMove(e.clientX));
+canvas.addEventListener('touchmove', (e) => { e.preventDefault(); pointerMove(e.touches[0].clientX); }, { passive: false });
+// Click / tap restarts from game over (mousemove must NOT: it would restart
+// the instant the player moves the mouse over the game-over screen).
+canvas.addEventListener('mousedown', (e) => { if (state === 'over') startGame(); else pointerMove(e.clientX); });
+canvas.addEventListener('touchstart', (e) => { e.preventDefault(); if (state === 'over') startGame(); else pointerMove(e.touches[0].clientX); }, { passive: false });
+
+function startGame() {
+  state = 'playing';
+  score = 0; lives = 3; elapsed = 0;
+  asteroids = []; stars = []; particles = []; popups = [];
+  asteroidTimer = 0.4; starTimer = 0.5;
+  ship.x = W / 2; ship.targetX = W / 2; invulnT = 0; shakeT = 0;
+}
+
+// ---- helpers ----
+function rand(a, b) { return a + Math.random() * (b - a); }
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+function dist2(ax, ay, bx, by) { const dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; }
+
+function spawnAsteroid() {
+  const r = rand(14, 30);
+  asteroids.push({ x: rand(r, W - r), y: -r - 10, r: r,
+    vy: (140 + score * 0.35) * rand(0.8, 1.3), rot: rand(0, 6.28), vr: rand(-1.5, 1.5) });
+}
+function spawnStar() {
+  stars.push({ x: rand(16, W - 16), y: -16, r: 11, vy: 120, phase: rand(0, 6.28) });
+}
+function burst(x, y, color, n, speed) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, 6.283), s = rand(speed * 0.3, speed);
+    particles.push({ x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+      life: rand(0.3, 0.8), maxLife: 0.8, color: color, r: rand(2, 5) });
+  }
+}
+function drawStar4(x, y, r, color) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x, y - r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.quadraticCurveTo(x, y, x, y + r);
+  ctx.quadraticCurveTo(x, y, x - r, y);
+  ctx.quadraticCurveTo(x, y, x, y - r);
+  ctx.fill();
+}
+
+// ---- update ----
+function update(dt) {
+  elapsed += dt;
+  for (const s of bgStars) { s.y += s.speed * dt; if (s.y > H + 2) { s.y = -2; s.x = Math.random() * W; } }
+
+  if (state !== 'playing') {
+    // Ambient drift behind the title / game-over overlay: the field stays
+    // alive instead of freezing mid-air.
+    for (const a of asteroids) a.y += a.vy * dt * 0.5;
+    for (const s of stars) s.y += s.vy * dt * 0.5;
+    for (let i = asteroids.length - 1; i >= 0; i--) if (asteroids[i].y - asteroids[i].r > H) asteroids.splice(i, 1);
+    for (let i = stars.length - 1; i >= 0; i--) if (stars[i].y - stars[i].r > H) stars.splice(i, 1);
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i]; p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+    return;
+  }
+
+  // ship movement
+  const left = keys['ArrowLeft'] || keys['a'] || keys['A'];
+  const right = keys['ArrowRight'] || keys['d'] || keys['D'];
+  if (left) { ship.x -= ship.speed * dt; ship.usingPointer = false; }
+  if (right) { ship.x += ship.speed * dt; ship.usingPointer = false; }
+  if (ship.usingPointer) {
+    const dx = ship.targetX - ship.x;
+    ship.x += clamp(dx, -ship.speed * dt, ship.speed * dt);
+  }
+  ship.x = clamp(ship.x, 24, W - 24);
+  if (invulnT > 0) invulnT -= dt;
+  if (shakeT > 0) shakeT -= dt;
+
+  // spawning, faster as the score grows
+  asteroidTimer -= dt;
+  if (asteroidTimer <= 0) { spawnAsteroid(); asteroidTimer = Math.max(0.28, 0.55 - score * 0.0004); }
+  starTimer -= dt;
+  if (starTimer <= 0) { spawnStar(); starTimer = 0.9; }
+
+  // asteroids
+  for (let i = asteroids.length - 1; i >= 0; i--) {
+    const a = asteroids[i];
+    a.y += a.vy * dt; a.rot += a.vr * dt;
+    if (a.y - a.r > H) { asteroids.splice(i, 1); continue; }
+    const rr = a.r + ship.r - 6;
+    if (invulnT <= 0 && dist2(a.x, a.y, ship.x, ship.y) < rr * rr) {
+      asteroids.splice(i, 1);
+      lives -= 1;
+      shakeT = 0.45;
+      invulnT = 1.2;
+      burst(ship.x, ship.y, MAGENTA, 26, 260);
+      beep(140, 0.3, 'sawtooth', 0.12);
+      if (lives <= 0) {
+        state = 'over';
+        burst(ship.x, ship.y, CYAN, 40, 320);
+        beep(90, 0.6, 'sawtooth', 0.12);
+      }
+    }
+  }
+
+  // stars
+  for (let i = stars.length - 1; i >= 0; i--) {
+    const s = stars[i];
+    s.y += s.vy * dt; s.phase += dt * 4;
+    if (s.y - s.r > H) { stars.splice(i, 1); continue; }
+    const rr = s.r + ship.r;
+    if (dist2(s.x, s.y, ship.x, ship.y) < rr * rr) {
+      stars.splice(i, 1);
+      score += 10;
+      popups.push({ x: s.x, y: s.y, text: '+10', life: 0.8 });
+      burst(s.x, s.y, GOLD, 10, 140);
+      beep(880, 0.09, 'square', 0.07);
+    }
+  }
+
+  // particles + popups
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i]; p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.98; p.vy *= 0.98; p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+  for (let i = popups.length - 1; i >= 0; i--) {
+    const p = popups[i]; p.y -= 40 * dt; p.life -= dt;
+    if (p.life <= 0) popups.splice(i, 1);
+  }
+}
+
+// ---- render ----
+function drawShip() {
+  ctx.save();
+  ctx.translate(ship.x, ship.y);
+  if (invulnT > 0 && Math.floor(elapsed * 12) % 2 === 0) ctx.globalAlpha = 0.35;
+  // engine flame
+  ctx.fillStyle = '#ff9f1c';
+  ctx.beginPath();
+  ctx.moveTo(-7, 16); ctx.lineTo(0, 30 + Math.random() * 8); ctx.lineTo(7, 16);
+  ctx.closePath(); ctx.fill();
+  // hull
+  ctx.fillStyle = CYAN;
+  ctx.beginPath();
+  ctx.moveTo(0, -20); ctx.lineTo(16, 14); ctx.lineTo(0, 8); ctx.lineTo(-16, 14);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = MAGENTA;
+  ctx.beginPath(); ctx.arc(0, -4, 5, 0, 6.283); ctx.fill();
+  ctx.restore();
+}
+
+function render() {
+  ctx.save();
+  if (shakeT > 0) ctx.translate(rand(-7, 7) * shakeT * 2, rand(-7, 7) * shakeT * 2);
+
+  // background
+  ctx.fillStyle = INK;
+  ctx.fillRect(-10, -10, W + 20, H + 20);
+  for (const s of bgStars) {
+    ctx.globalAlpha = 0.35 + 0.65 * Math.abs(Math.sin(elapsed * 2 + s.tw));
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(s.x, s.y, s.r, s.r);
+  }
+  ctx.globalAlpha = 1;
+
+  // stars (collectibles)
+  for (const s of stars) {
+    const pulse = 1 + 0.15 * Math.sin(s.phase);
+    ctx.save();
+    ctx.shadowColor = GOLD; ctx.shadowBlur = 14;
+    drawStar4(s.x, s.y, s.r * pulse, GOLD);
+    ctx.restore();
+  }
+
+  // asteroids
+  for (const a of asteroids) {
+    ctx.save();
+    ctx.translate(a.x, a.y); ctx.rotate(a.rot);
+    ctx.fillStyle = '#5b5470';
+    ctx.beginPath(); ctx.arc(0, 0, a.r, 0, 6.283); ctx.fill();
+    ctx.strokeStyle = '#8d86a8'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#453e58';
+    ctx.beginPath(); ctx.arc(-a.r * 0.3, -a.r * 0.2, a.r * 0.28, 0, 6.283); ctx.fill();
+    ctx.beginPath(); ctx.arc(a.r * 0.35, a.r * 0.3, a.r * 0.2, 0, 6.283); ctx.fill();
+    ctx.restore();
+  }
+
+  // particles
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  if (state !== 'over') drawShip();
+
+  // popups
+  ctx.font = 'bold 20px monospace';
+  ctx.textAlign = 'center';
+  for (const p of popups) {
+    ctx.globalAlpha = Math.max(0, p.life / 0.8);
+    ctx.fillStyle = GOLD;
+    ctx.fillText(p.text, p.x, p.y);
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.restore();
+
+  // HUD
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 26px monospace';
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText('SCORE ' + score, 18, 38);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = MAGENTA;
+  let hearts = '';
+  for (let i = 0; i < 3; i++) hearts += (i < lives) ? '♥ ' : '♡ ';
+  ctx.fillText(hearts, W - 18, 38);
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 15px monospace';
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.fillText('O R B I T   D O D G E', W / 2, 34);
+
+  if (state === 'title') {
+    ctx.fillStyle = 'rgba(7,4,13,0.62)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 64px monospace';
+    ctx.fillText('ORBIT DODGE', W / 2, H / 2 - 30);
+    ctx.fillStyle = CYAN;
+    ctx.font = 'bold 24px monospace';
+    ctx.fillText('one prompt. one ship. no mercy.', W / 2, H / 2 + 14);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '20px monospace';
+    ctx.fillText('← → / mouse / touch to fly — press any key to start', W / 2, H / 2 + 62);
+  } else if (state === 'over') {
+    ctx.fillStyle = 'rgba(7,4,13,0.72)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = MAGENTA;
+    ctx.font = 'bold 58px monospace';
+    ctx.fillText('GAME OVER', W / 2, H / 2 - 20);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 28px monospace';
+    ctx.fillText('SCORE ' + score, W / 2, H / 2 + 28);
+    ctx.font = '20px monospace';
+    ctx.fillStyle = CYAN;
+    ctx.fillText('press R or tap to fly again', W / 2, H / 2 + 70);
+  }
+}
+
+// ---- main loop ----
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

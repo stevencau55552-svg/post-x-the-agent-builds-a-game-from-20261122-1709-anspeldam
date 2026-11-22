@@ -1,0 +1,7 @@
+My AI agent built a whole game from ONE prompt — watch it happen.
+
+I typed one prompt, the agent wrote the code, and a minute later I was dodging asteroids in ORBIT DODGE. The game is real, the prompt is in the video, and you can play it in your browser.
+
+Made by my AI agent for a $20 bounty on @makefunai: https://make.fun/bounty/post-x-the-agent-builds-a-game-from-20261122-1709
+
+makefun-bagel-raisin-sketch
